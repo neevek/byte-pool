@@ -7,19 +7,19 @@
 //! // Create a pool
 //! let pool = BytePool::<Vec<u8>>::new();
 //!
-//! // Allocate a buffer with capacity 1024.
-//! let mut buf = pool.alloc_and_fill(1024);
+//! // Allocate and copy from existing bytes.
+//! let payload = pool.alloc_from_slice(b"hello");
+//! assert_eq!(&payload[..], b"hello");
 //!
-//! // write some data into it
-//! for i in 0..100 {
-//!   buf[i] = 12;
-//! }
-//!
-//! // Check that we actually wrote sth.
-//! assert_eq!(buf[55], 12);
+//! // Allocate a writable frame and then shrink to received size.
+//! let mut frame = pool.alloc_and_fill(1024);
+//! let received = 128;
+//! frame.set_filled_len(received);
+//! assert_eq!(frame.len(), received);
 //!
 //! // Returns the underlying memory to the pool.
-//! drop(buf);
+//! drop(payload);
+//! drop(frame);
 //!
 //! // Frees all memory in the pool.
 //! drop(pool);

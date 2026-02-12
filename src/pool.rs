@@ -103,6 +103,15 @@ impl<T: Poolable> BytePool<T> {
     }
 }
 
+impl<T: Default + Clone> BytePool<Vec<T>> {
+    /// Allocates a new block and fills it with a copy of `data`.
+    pub fn alloc_from_slice(&self, data: &[T]) -> Block<'_, Vec<T>> {
+        let mut block = self.alloc(data.len());
+        block.extend_from_slice(data);
+        block
+    }
+}
+
 impl<'a, T: Poolable> Drop for Block<'a, T> {
     fn drop(&mut self) {
         let mut data = mem::ManuallyDrop::into_inner(unsafe { ptr::read(&self.data) });
@@ -129,6 +138,23 @@ impl<'a, T: Poolable + Realloc> Block<'a, T> {
     /// Resizes a block to a new size.
     pub fn realloc(&mut self, new_size: usize) {
         self.data.realloc(new_size);
+    }
+}
+
+impl<'a, T: Default + Clone> Block<'a, Vec<T>> {
+    /// Updates the logical length after writing into a pre-sized buffer.
+    ///
+    /// This is intended for buffers created by `alloc_and_fill`, where `len()`
+    /// starts at the maximum writable size. `filled_len` must not exceed the
+    /// current length.
+    pub fn set_filled_len(&mut self, filled_len: usize) {
+        assert!(
+            filled_len <= self.len(),
+            "filled_len ({}) must be <= current len ({})",
+            filled_len,
+            self.len()
+        );
+        self.truncate(filled_len);
     }
 }
 
@@ -170,6 +196,14 @@ mod tests {
     }
 
     #[test]
+    fn alloc_from_slice() {
+        let pool = BytePool::<Vec<u8>>::new();
+        let buf = pool.alloc_from_slice(b"hello");
+        assert_eq!(buf.len(), 5);
+        assert_eq!(&buf[..], b"hello");
+    }
+
+    #[test]
     fn len_and_capacity() {
         let pool = BytePool::<Vec<u8>>::new();
         for i in 1..10 {
@@ -188,6 +222,24 @@ mod tests {
             let buf = pool.alloc(i * 10000);
             assert_eq!(buf.len(), 0)
         }
+    }
+
+    #[test]
+    fn set_filled_len() {
+        let pool = BytePool::<Vec<u8>>::new();
+        let mut frame = pool.alloc_and_fill(64);
+        frame[10] = 123;
+        frame.set_filled_len(16);
+        assert_eq!(frame.len(), 16);
+        assert_eq!(frame[10], 123);
+    }
+
+    #[test]
+    #[should_panic(expected = "filled_len")]
+    fn set_filled_len_panics_when_too_large() {
+        let pool = BytePool::<Vec<u8>>::new();
+        let mut frame = pool.alloc_and_fill(16);
+        frame.set_filled_len(17);
     }
 
     #[test]
