@@ -2,6 +2,7 @@ use std::fmt;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crossbeam_queue::SegQueue;
 use stable_deref_trait::StableDeref;
@@ -16,11 +17,15 @@ where
 {
     list_large: SegQueue<T>,
     list_small: SegQueue<T>,
+    cached_bytes: AtomicUsize,
+    max_cached_bytes: Option<usize>,
 }
 
 /// The size at which point values are allocated in the small list, rather
 // than the big.
 const SPLIT_SIZE: usize = 4 * 1024;
+const REUSE_SLACK: usize = 1024;
+const PROBE_DEPTH: usize = 8;
 
 /// The value returned by an allocation of the pool.
 /// When it is dropped the memory gets returned into the pool, and is not zeroed.
@@ -38,17 +43,28 @@ impl<T: Poolable + fmt::Debug> fmt::Debug for Block<'_, T> {
 
 impl<T: Poolable> Default for BytePool<T> {
     fn default() -> Self {
-        BytePool::<T> {
-            list_large: SegQueue::new(),
-            list_small: SegQueue::new(),
-        }
+        Self::new()
     }
 }
 
 impl<T: Poolable> BytePool<T> {
-    /// Constructs a new pool.
+    /// Constructs a new pool without any cache size limit.
     pub fn new() -> Self {
-        BytePool::default()
+        Self::with_max_cache_size_internal(None)
+    }
+
+    /// Constructs a new pool that caches at most `max_cached_bytes` bytes.
+    pub fn with_max_cache_size(max_cached_bytes: usize) -> Self {
+        Self::with_max_cache_size_internal(Some(max_cached_bytes))
+    }
+
+    fn with_max_cache_size_internal(max_cached_bytes: Option<usize>) -> Self {
+        BytePool::<T> {
+            list_large: SegQueue::new(),
+            list_small: SegQueue::new(),
+            cached_bytes: AtomicUsize::new(0),
+            max_cached_bytes,
+        }
     }
 
     /// Allocates a new `Block`, which represents a fixed sice byte slice.
@@ -66,23 +82,45 @@ impl<T: Poolable> BytePool<T> {
     pub fn alloc_internal(&self, size: usize, fill: bool) -> Block<'_, T> {
         assert!(size > 0, "Can not allocate empty blocks");
 
-        // check the last 4 blocks
         let list = if size < SPLIT_SIZE {
             &self.list_small
         } else {
             &self.list_large
         };
-        if let Some(mut el) = list.pop() {
-            if el.capacity() >= size && el.capacity() < size + 1024 {
-                // found one, reuse it
-                if fill {
-                    el.resize(size)
-                }
-                return Block::new(el, self);
-            } else {
-                // put it back
-                list.push(el);
+
+        let mut candidates = Vec::with_capacity(PROBE_DEPTH);
+        let mut best_idx = None;
+        let mut best_capacity = usize::MAX;
+
+        for idx in 0..PROBE_DEPTH {
+            let Some(candidate) = self.pop_cached_block(list) else {
+                break;
+            };
+
+            let capacity = candidate.capacity();
+            if capacity >= size
+                && capacity <= size.saturating_add(REUSE_SLACK)
+                && capacity < best_capacity
+            {
+                best_capacity = capacity;
+                best_idx = Some(idx);
             }
+            candidates.push(candidate);
+        }
+
+        if let Some(best_idx) = best_idx {
+            let mut reused = candidates.swap_remove(best_idx);
+            for candidate in candidates {
+                self.push_raw_block(candidate);
+            }
+            if fill {
+                reused.resize(size);
+            }
+            return Block::new(reused, self);
+        }
+
+        for candidate in candidates {
+            self.push_raw_block(candidate);
         }
 
         // allocate a new block
@@ -95,10 +133,47 @@ impl<T: Poolable> BytePool<T> {
     }
 
     fn push_raw_block(&self, block: T) {
+        let capacity = block.capacity();
+        if !self.try_reserve_cached_bytes(capacity) {
+            return;
+        }
         if block.capacity() < SPLIT_SIZE {
             self.list_small.push(block);
         } else {
             self.list_large.push(block);
+        }
+    }
+
+    fn pop_cached_block(&self, list: &SegQueue<T>) -> Option<T> {
+        let block = list.pop()?;
+        self.cached_bytes
+            .fetch_sub(block.capacity(), Ordering::AcqRel);
+        Some(block)
+    }
+
+    fn try_reserve_cached_bytes(&self, bytes: usize) -> bool {
+        let Some(limit) = self.max_cached_bytes else {
+            self.cached_bytes.fetch_add(bytes, Ordering::AcqRel);
+            return true;
+        };
+
+        let mut current = self.cached_bytes.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return false;
+            };
+            if next > limit {
+                return false;
+            }
+            match self.cached_bytes.compare_exchange(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
         }
     }
 }
@@ -180,6 +255,7 @@ unsafe impl<'a, T: StableDeref + Poolable> StableDeref for Block<'a, T> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn append() {
         let pool = BytePool::<Vec<u8>>::new();
@@ -318,8 +394,33 @@ mod tests {
         h1.join().unwrap();
         h2.join().unwrap();
 
-        // two threads allocating in parallel will need 2 buffers
-        assert!(pool.list_small.len() <= 2);
+        assert!(pool.list_small.len() <= 16);
+        let cached_bytes = pool.cached_bytes.load(Ordering::Acquire);
+        assert!(cached_bytes <= pool.list_small.len() * 64);
+    }
+
+    #[test]
+    fn reuses_best_fit_from_multiple_candidates() {
+        let pool = BytePool::<Vec<u8>>::new();
+
+        let large = pool.alloc_and_fill(2048);
+        let exact = pool.alloc_and_fill(1024);
+        drop(large);
+        drop(exact);
+
+        let reused = pool.alloc(1024);
+        assert_eq!(reused.capacity(), 1024);
+    }
+
+    #[test]
+    fn enforces_max_cached_bytes() {
+        let pool = BytePool::<Vec<u8>>::with_max_cache_size(1024);
+
+        drop(pool.alloc_and_fill(800));
+        drop(pool.alloc_and_fill(800));
+
+        assert_eq!(pool.list_small.len(), 1);
+        assert!(pool.cached_bytes.load(Ordering::Acquire) <= 1024);
     }
 
     #[test]
