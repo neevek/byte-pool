@@ -80,7 +80,10 @@ impl<T: Poolable> BytePool<T> {
     }
 
     pub fn alloc_internal(&self, size: usize, fill: bool) -> Block<'_, T> {
-        assert!(size > 0, "Can not allocate empty blocks");
+        if size == 0 {
+            let data = if fill { T::alloc_and_fill(0) } else { T::alloc(0) };
+            return Block::new(data, self);
+        }
 
         let list = if size < SPLIT_SIZE {
             &self.list_small
@@ -134,10 +137,13 @@ impl<T: Poolable> BytePool<T> {
 
     fn push_raw_block(&self, block: T) {
         let capacity = block.capacity();
+        if capacity == 0 {
+            return;
+        }
         if !self.try_reserve_cached_bytes(capacity) {
             return;
         }
-        if block.capacity() < SPLIT_SIZE {
+        if capacity < SPLIT_SIZE {
             self.list_small.push(block);
         } else {
             self.list_large.push(block);
@@ -298,6 +304,30 @@ mod tests {
             let buf = pool.alloc(i * 10000);
             assert_eq!(buf.len(), 0)
         }
+    }
+
+    #[test]
+    fn zero_sized_allocations_are_allowed_and_not_cached() {
+        let pool = BytePool::<Vec<u8>>::new();
+
+        let buf = pool.alloc(0);
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.capacity(), 0);
+        drop(buf);
+
+        let filled = pool.alloc_and_fill(0);
+        assert_eq!(filled.len(), 0);
+        assert_eq!(filled.capacity(), 0);
+        drop(filled);
+
+        let from_slice = pool.alloc_from_slice(&[]);
+        assert_eq!(from_slice.len(), 0);
+        assert_eq!(from_slice.capacity(), 0);
+        drop(from_slice);
+
+        assert_eq!(pool.list_small.len(), 0);
+        assert_eq!(pool.list_large.len(), 0);
+        assert_eq!(pool.cached_bytes.load(Ordering::Acquire), 0);
     }
 
     #[test]
