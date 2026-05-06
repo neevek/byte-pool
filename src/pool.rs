@@ -15,17 +15,49 @@ pub struct BytePool<T = Vec<u8>>
 where
     T: Poolable,
 {
-    list_large: SegQueue<T>,
-    list_small: SegQueue<T>,
+    buckets: [SegQueue<T>; NUM_SIZE_CLASSES],
     cached_bytes: AtomicUsize,
     max_cached_bytes: Option<usize>,
 }
 
-/// The size at which point values are allocated in the small list, rather
-// than the big.
-const SPLIT_SIZE: usize = 4 * 1024;
-const REUSE_SLACK: usize = 1024;
+/// Number of power-of-two size class buckets.
+const NUM_SIZE_CLASSES: usize = 16;
+/// Sizes below 2^MIN_SIZE_CLASS_BITS all land in bucket 0.
+const MIN_SIZE_CLASS_BITS: usize = 8;
 const PROBE_DEPTH: usize = 8;
+
+/// Maps a non-zero capacity to a bucket index.
+/// Bucket 0 covers [1, 255], bucket 1 covers [256, 511], and so on,
+/// each doubling in range. Bucket 15 captures everything above 4 MiB.
+#[inline]
+fn size_class(size: usize) -> usize {
+    debug_assert!(size > 0);
+    let bits = (usize::BITS as usize) - (size.leading_zeros() as usize);
+    bits.saturating_sub(MIN_SIZE_CLASS_BITS).min(NUM_SIZE_CLASSES - 1)
+}
+
+/// Returns the maximum size that maps to the same size class as `size`,
+/// used by `alloc_from_slice` to pre-size blocks so they serve the widest
+/// range of future requests within the same bucket.
+///
+/// For sizes in the capped top class the input is returned unchanged —
+/// rounding up would double or more the allocation (e.g. 5 MiB → 8 MiB).
+#[inline]
+fn class_slab_size(size: usize) -> usize {
+    if size == 0 {
+        return 0;
+    }
+    let bits = (usize::BITS as usize) - (size.leading_zeros() as usize);
+    let class = bits.saturating_sub(MIN_SIZE_CLASS_BITS).min(NUM_SIZE_CLASSES - 1);
+    if class == NUM_SIZE_CLASSES - 1 {
+        return size;
+    }
+    if bits <= MIN_SIZE_CLASS_BITS {
+        (1_usize << MIN_SIZE_CLASS_BITS) - 1
+    } else {
+        (1_usize << bits) - 1
+    }
+}
 
 /// The value returned by an allocation of the pool.
 /// When it is dropped the memory gets returned into the pool, and is not zeroed.
@@ -60,8 +92,7 @@ impl<T: Poolable> BytePool<T> {
 
     fn with_max_cache_size_internal(max_cached_bytes: Option<usize>) -> Self {
         BytePool::<T> {
-            list_large: SegQueue::new(),
-            list_small: SegQueue::new(),
+            buckets: std::array::from_fn(|_| SegQueue::new()),
             cached_bytes: AtomicUsize::new(0),
             max_cached_bytes,
         }
@@ -85,26 +116,53 @@ impl<T: Poolable> BytePool<T> {
             return Block::new(data, self);
         }
 
-        let list = if size < SPLIT_SIZE {
-            &self.list_small
+        let bucket_idx = size_class(size);
+
+        // Primary probe. If that misses, probe the next bucket as a fallback:
+        // some Poolable allocators (e.g. HashMap) report a capacity larger than
+        // requested, so a block dropped after alloc(N) can land one class higher
+        // than the class future alloc(N) calls probe.
+        if let Some(data) = self.try_alloc_from_bucket(bucket_idx, size, fill) {
+            return Block::new(data, self);
+        }
+        if bucket_idx + 1 < NUM_SIZE_CLASSES {
+            if let Some(data) = self.try_alloc_from_bucket(bucket_idx + 1, size, fill) {
+                return Block::new(data, self);
+            }
+        }
+
+        let data = if fill {
+            T::alloc_and_fill(size)
         } else {
-            &self.list_large
+            T::alloc(size)
+        };
+        Block::new(data, self)
+    }
+
+    /// Probes a single bucket for the best-fit block that satisfies `size`.
+    /// Returns `Some(data)` on a hit (all other candidates are pushed back),
+    /// or `None` on a miss (all candidates are pushed back).
+    fn try_alloc_from_bucket(&self, bucket_idx: usize, size: usize, fill: bool) -> Option<T> {
+        // Bucket 15 is the unbounded catch-all; cap reuse at 4× to prevent
+        // returning, e.g., a 1 GiB cached block for a 4 MiB request.
+        let reuse_upper = if bucket_idx == NUM_SIZE_CLASSES - 1 {
+            size.saturating_mul(4)
+        } else {
+            usize::MAX
         };
 
+        let bucket = &self.buckets[bucket_idx];
         let mut candidates = Vec::with_capacity(PROBE_DEPTH);
         let mut best_idx = None;
         let mut best_capacity = usize::MAX;
 
         for idx in 0..PROBE_DEPTH {
-            let Some(candidate) = self.pop_cached_block(list) else {
+            let Some(candidate) = self.pop_cached_block(bucket) else {
                 break;
             };
-
             let capacity = candidate.capacity();
-            if capacity >= size
-                && capacity <= size.saturating_add(REUSE_SLACK)
-                && capacity < best_capacity
-            {
+            // Best-fit: smallest block that is large enough and within the reuse bound.
+            if capacity >= size && capacity <= reuse_upper && capacity < best_capacity {
                 best_capacity = capacity;
                 best_idx = Some(idx);
             }
@@ -119,20 +177,13 @@ impl<T: Poolable> BytePool<T> {
             if fill {
                 reused.resize(size);
             }
-            return Block::new(reused, self);
-        }
-
-        for candidate in candidates {
-            self.push_raw_block(candidate);
-        }
-
-        // allocate a new block
-        let data = if fill {
-            T::alloc_and_fill(size)
+            Some(reused)
         } else {
-            T::alloc(size)
-        };
-        Block::new(data, self)
+            for candidate in candidates {
+                self.push_raw_block(candidate);
+            }
+            None
+        }
     }
 
     fn push_raw_block(&self, block: T) {
@@ -143,11 +194,7 @@ impl<T: Poolable> BytePool<T> {
         if !self.try_reserve_cached_bytes(capacity) {
             return;
         }
-        if capacity < SPLIT_SIZE {
-            self.list_small.push(block);
-        } else {
-            self.list_large.push(block);
-        }
+        self.buckets[size_class(capacity)].push(block);
     }
 
     fn pop_cached_block(&self, list: &SegQueue<T>) -> Option<T> {
@@ -182,15 +229,38 @@ impl<T: Poolable> BytePool<T> {
             }
         }
     }
+
+    #[cfg(test)]
+    fn total_cached_count(&self) -> usize {
+        self.buckets.iter().map(|q| q.len()).sum()
+    }
 }
 
 impl<T: Default + Clone> BytePool<Vec<T>> {
     /// Allocates a new block and fills it with a copy of `data`.
+    ///
+    /// The block is sized to the upper bound of the byte-size class for `data`,
+    /// so that future calls with similarly-sized slices are more likely to hit
+    /// a cached block.
     pub fn alloc_from_slice(&self, data: &[T]) -> Block<'_, Vec<T>> {
-        let mut block = self.alloc(data.len());
+        let alloc_size = slab_elem_count::<T>(data.len());
+        let mut block = self.alloc(alloc_size);
         block.extend_from_slice(data);
         block
     }
+}
+
+/// Converts an element count to a slab-rounded element count using byte-based
+/// size classes, so that `alloc_from_slice` over-allocates proportionally to
+/// the element byte size rather than treating element count as a byte count.
+fn slab_elem_count<T>(len: usize) -> usize {
+    let elem_size = std::mem::size_of::<T>();
+    if elem_size == 0 || len == 0 {
+        return len;
+    }
+    let byte_len = len.saturating_mul(elem_size);
+    let slab_bytes = class_slab_size(byte_len);
+    (slab_bytes + elem_size - 1) / elem_size
 }
 
 impl<'a, T: Poolable> Drop for Block<'a, T> {
@@ -325,8 +395,7 @@ mod tests {
         assert_eq!(from_slice.capacity(), 0);
         drop(from_slice);
 
-        assert_eq!(pool.list_small.len(), 0);
-        assert_eq!(pool.list_large.len(), 0);
+        assert_eq!(pool.total_cached_count(), 0);
         assert_eq!(pool.cached_bytes.load(Ordering::Acquire), 0);
     }
 
@@ -424,9 +493,10 @@ mod tests {
         h1.join().unwrap();
         h2.join().unwrap();
 
-        assert!(pool.list_small.len() <= 16);
+        let count = pool.total_cached_count();
+        assert!(count <= 32);
         let cached_bytes = pool.cached_bytes.load(Ordering::Acquire);
-        assert!(cached_bytes <= pool.list_small.len() * 64);
+        assert!(cached_bytes <= count * 64);
     }
 
     #[test]
@@ -449,7 +519,7 @@ mod tests {
         drop(pool.alloc_and_fill(800));
         drop(pool.alloc_and_fill(800));
 
-        assert_eq!(pool.list_small.len(), 1);
+        assert_eq!(pool.total_cached_count(), 1);
         assert!(pool.cached_bytes.load(Ordering::Acquire) <= 1024);
     }
 
@@ -518,5 +588,106 @@ mod tests {
                 assert_eq!(*el.1, i.to_string());
             }
         }
+    }
+
+    #[test]
+    fn size_class_buckets() {
+        assert_eq!(size_class(1), 0);
+        assert_eq!(size_class(255), 0);
+        assert_eq!(size_class(256), 1);
+        assert_eq!(size_class(511), 1);
+        assert_eq!(size_class(512), 2);
+        assert_eq!(size_class(1024), 3);
+        assert_eq!(size_class(4096), 5);
+        assert_eq!(size_class(usize::MAX), NUM_SIZE_CLASSES - 1);
+    }
+
+    #[test]
+    fn class_slab_size_rounds_up() {
+        assert_eq!(class_slab_size(0), 0);
+        assert_eq!(class_slab_size(1), 255);
+        assert_eq!(class_slab_size(255), 255);
+        assert_eq!(class_slab_size(256), 511);
+        assert_eq!(class_slab_size(300), 511);
+        assert_eq!(class_slab_size(511), 511);
+        assert_eq!(class_slab_size(512), 1023);
+        // Top class (>= 4 MiB): returned unchanged to avoid doubling large allocations.
+        assert_eq!(class_slab_size(4 * 1024 * 1024), 4 * 1024 * 1024);
+        assert_eq!(class_slab_size(5 * 1024 * 1024), 5 * 1024 * 1024);
+    }
+
+    #[test]
+    fn alloc_from_slice_reuses_across_similar_sizes() {
+        let pool = BytePool::<Vec<u8>>::new();
+
+        // alloc_from_slice(5) sizes up to class_slab_size(5) = 255
+        let buf = pool.alloc_from_slice(b"hello");
+        assert_eq!(buf.len(), 5);
+        drop(buf); // returns a 255-capacity block to bucket 0
+
+        // A later alloc_from_slice with different size in the same class reuses it
+        let buf2 = pool.alloc_from_slice(b"world!!");
+        assert_eq!(buf2.len(), 7);
+        // capacity should be from the reused block (255), not freshly allocated
+        assert!(buf2.capacity() >= 255);
+    }
+
+    #[test]
+    fn blocks_route_to_correct_buckets() {
+        let pool = BytePool::<Vec<u8>>::new();
+
+        let b1 = pool.alloc(256); // class 1
+        let b2 = pool.alloc(512); // class 2
+        let b3 = pool.alloc(1024); // class 3
+        drop(b1);
+        drop(b2);
+        drop(b3);
+
+        // Each size class has exactly one block
+        assert_eq!(pool.buckets[1].len(), 1); // 256 → class 1
+        assert_eq!(pool.buckets[2].len(), 1); // 512 → class 2
+        assert_eq!(pool.buckets[3].len(), 1); // 1024 → class 3
+        assert_eq!(pool.total_cached_count(), 3);
+    }
+
+    #[test]
+    fn alloc_from_slice_large_element_does_not_over_allocate() {
+        // T = u64 (8 bytes). Without byte-based sizing, class_slab_size(data.len())
+        // = class_slab_size(1) = 255 elements = 2040 bytes.
+        // With the fix the slab is computed in bytes:
+        //   byte_len = 8, class_slab_size(8) = 255, ceil(255/8) = 32 elements = 256 bytes.
+        let pool = BytePool::<Vec<u64>>::new();
+        let buf = pool.alloc_from_slice(&[42u64]);
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf[0], 42u64);
+        // Capacity must be byte-proportional (≤ 32 elements), not element-count-
+        // proportional (the old broken ceiling of 255 elements).
+        assert!(
+            buf.capacity() < 255,
+            "capacity should be byte-proportional: got {}",
+            buf.capacity()
+        );
+    }
+
+    #[test]
+    fn reuses_allocator_rounded_block_via_adjacent_bucket() {
+        // Allocators such as HashMap may round up the reported capacity beyond
+        // the requested size, landing the returned block in a higher bucket than
+        // future alloc(N) calls probe. Verify that the fallback probe recovers it.
+        use std::collections::HashMap;
+        let pool: BytePool<HashMap<u64, u64>> = BytePool::new();
+
+        let block = pool.alloc(255);
+        let actual_cap = block.capacity(); // may be > 255 due to HashMap rounding
+        drop(block);
+
+        // The next alloc(255) must reuse the cached block, not allocate fresh.
+        let block2 = pool.alloc(255);
+        assert_eq!(
+            block2.capacity(),
+            actual_cap,
+            "block should be reused even when capacity rounded into the next class"
+        );
+        assert_eq!(pool.total_cached_count(), 0, "cache should be empty after reuse");
     }
 }
